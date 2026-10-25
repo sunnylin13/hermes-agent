@@ -17,6 +17,15 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
     monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
     monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
+    # create_task resolves declared skills against the assignee at entry
+    # (kanban_skill_gate); this test is about policy freezing, so give the
+    # fake profile a payload the resolver can actually load.
+    _owned_skill = tmp_path / 'skills' / 'owned-skill'
+    _owned_skill.mkdir(parents=True)
+    (_owned_skill / 'SKILL.md').write_text(
+        '---\nname: owned-skill\ndescription: claim-policy fixture skill\n---\n\nBody.\n',
+        encoding='utf-8',
+    )
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
     (workspace / 'pyproject.toml').write_text('[project]\nname = "task"\n')  # a code worktree
