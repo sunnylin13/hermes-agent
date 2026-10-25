@@ -126,6 +126,11 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    blocked_missing_skills: list[tuple[str, list[str]]] = field(default_factory=list)
+    """``(task_id, missing_skills)`` rows the skill-resolution gate refused to
+    spawn (t_9691bf56): the assignee profile cannot resolve a declared card
+    skill, so the card was (or, in ``dry_run``, would be) parked ``blocked``
+    /needs_input instead of crash-looping a worker. Operator-actionable."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2050,6 +2055,36 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _declared_card_skills(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """The card's own ``skills`` list (JSON column), [] when unset/malformed.
+    The review lane's forced ``sdlc-review`` is a dispatcher policy, not a
+    card declaration, and is deliberately out of scope here."""
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not row["skills"]:
+        return []
+    import json
+    try:
+        raw = json.loads(row["skills"])
+    except Exception:
+        return []
+    return [str(s).strip() for s in raw if str(s or "").strip()] if isinstance(raw, list) else []
+
+
+def _resolve_card_skills(assignee: str, declared: list[str]):
+    """Shared-resolver call for the spawn gate. Unexpected failures fail open
+    (log only): the worker-side load stays the last line of defense — but a
+    genuine missing verdict must never be swallowed into a crash-loop."""
+    try:
+        from hermes_cli.kanban_skill_gate import resolve_profile_skills
+        return resolve_profile_skills(assignee, declared)
+    except Exception:
+        _kb._log.warning(
+            "kanban dispatch: skill-resolution gate skipped for assignee=%r skills=%r",
+            assignee, declared, exc_info=True,
+        )
+        return None
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2112,6 +2147,31 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Skill-resolution gate (t_78e230ae, incident t_9691bf56): a card whose
+    # declared skills the assignee profile cannot load used to crash-loop its
+    # worker — eight spawns before anything explained itself. This is the
+    # AUTHORITY gate: create/assign validate optimistically and fail open for
+    # profiles this host cannot see; nothing spawns past here with an
+    # unresolvable name. Refuse WITHOUT claiming (no run, no admission, no
+    # worker) and park the card needs_input naming the missing skill(s).
+    declared = _declared_card_skills(conn, task_id)
+    if declared:
+        resolution = _resolve_card_skills(assignee, declared)
+        if resolution is not None and resolution.missing:
+            missing = list(resolution.missing)
+            result.blocked_missing_skills.append((task_id, missing))
+            if not dry_run:
+                reason = (
+                    f"dispatcher refused the spawn: skill(s) {missing!r} are not "
+                    f"resolvable for assignee profile {assignee!r} (unknown to its "
+                    "skills dirs, or operator-disabled). Fix the card's skills "
+                    "field or install the skill, then unblock."
+                )
+                _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+                with contextlib.suppress(Exception):
+                    _kb.add_comment(conn, task_id, "dispatcher", reason)
+            return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent

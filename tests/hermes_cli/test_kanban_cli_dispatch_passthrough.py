@@ -19,14 +19,33 @@ import pytest
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+    """Spin up a fresh HERMES_HOME with a clean kanban DB.
+
+    The module purge MUST be undone on teardown: a bare ``del sys.modules``
+    leaves every later test in the session importing SECOND copies of
+    ``hermes_constants``/``hermes_cli`` while modules imported earlier (e.g.
+    ``tools.skills_tool``) still reference the ORIGINAL ones — contextvars
+    (HERMES_HOME override) then bind to a different copy than the resolver
+    reads, and unrelated tests start failing for an ordering artifact.
+    """
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    saved = {
+        name: mod for name, mod in sys.modules.items()
+        if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield test_home
+    finally:
+        for name in [
+            n for n in sys.modules
+            if n.startswith("hermes_cli") or n.startswith("hermes_state") or n == "hermes_constants"
+        ]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

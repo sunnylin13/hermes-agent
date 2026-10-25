@@ -23,15 +23,28 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
             fh.write("{}\n")  # identity marker: a bare dir is not a profile
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    # Purge + RESTORE (see test_kanban_cli_dispatch_passthrough for why an
+    # unrestored purge poisons every later test's module copies and overrides).
+    saved = {
+        name: mod for name, mod in sys.modules.items()
+        if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+    }
+    for name in saved:
+        del sys.modules[name]
     from hermes_cli import kanban_db
     from hermes_cli import kanban_db_dispatch
     # The module purge above discards the conftest's memory-sample neutralizer;
     # re-apply it so the host's live memory pressure cannot cap this tick.
     monkeypatch.setattr(kanban_db_dispatch, "_system_memory_sample", dict)
-    yield kanban_db
+    try:
+        yield kanban_db
+    finally:
+        for name in [
+            n for n in sys.modules
+            if n.startswith("hermes_cli") or n.startswith("hermes_state") or n == "hermes_constants"
+        ]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):

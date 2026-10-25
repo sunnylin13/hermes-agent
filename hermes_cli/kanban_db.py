@@ -1232,6 +1232,26 @@ def create_task(
         if row:
             return row["id"]
 
+    # Skills the assignee profile cannot load crash its worker at startup
+    # (t_9691bf56). Validate at the entry when both sides are known; an
+    # unverifiable profile (cross-host board) fails open to the dispatcher gate.
+    # After the idempotency check so a retry of an existing card keeps its
+    # "return the same id" contract.
+    if assignee and skills_list:
+        from hermes_cli.kanban_skill_gate import format_unresolvable_error, resolve_profile_skills
+        _skill_check = resolve_profile_skills(assignee, skills_list)
+        if _skill_check is None:
+            # Cross-host / unreadable profile dir: cannot check here. Degrade to
+            # a warning and let the card through — the dispatcher gate (same host
+            # as the spawn) is the authority and still refuses a bad name.
+            _log.warning(
+                "kanban: could not verify skills %r against assignee %r on this "
+                "host (profile dir unreadable); deferring to the dispatch gate",
+                skills_list, assignee,
+            )
+        elif _skill_check.missing:
+            raise ValueError(format_unresolvable_error(assignee, _skill_check))
+
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1452,8 +1472,33 @@ def list_tasks(
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+    """Assign/reassign; raises RuntimeError while the task is running under a claim.
+
+    Raises ValueError when the card declares ``skills`` the NEW assignee cannot
+    resolve (t_9691bf56): a handoff to a profile without the skill would crash
+    its worker at startup, so the handoff is refused before anything is written.
+    """
     profile = _canonical_assignee(profile)
+    # Validate the incoming profile against the card's declared skills BEFORE
+    # opening the write txn: resolution is file I/O and must not hold the
+    # board's single-writer lock. (The dispatcher gate is the authority; this
+    # entry check is allowed to race a concurrent skills edit.)
+    if profile:
+        skills_row = conn.execute(
+            "SELECT skills FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if skills_row is not None and skills_row["skills"]:
+            try:
+                _card_skills = json.loads(skills_row["skills"]) or []
+            except Exception:
+                _card_skills = []
+            if _card_skills:
+                from hermes_cli.kanban_skill_gate import (
+                    format_unresolvable_error, resolve_profile_skills,
+                )
+                _skill_check = resolve_profile_skills(profile, _card_skills)
+                if _skill_check is not None and _skill_check.missing:
+                    raise ValueError(format_unresolvable_error(profile, _skill_check))
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
