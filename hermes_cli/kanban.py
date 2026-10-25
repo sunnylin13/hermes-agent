@@ -151,7 +151,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+        return _err(
+            "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI\n"
+            "This fence is by design for shells inside a Kanban worker's process tree: run the "
+            "mutation from the owning session via its kanban_* tools, or from a shell outside a Kanban worker."
+        )
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).

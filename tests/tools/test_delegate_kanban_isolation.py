@@ -347,3 +347,26 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+def test_delegated_child_cli_fence_names_sanctioned_paths(monkeypatch, capsys):
+    """The fence rejection (t_558b34dc: an ops worker hit it while trying to unblock a card
+    from its own terminal) must tell the operator the sanctioned route, per the card ruling:
+    「防線錯誤訊息加一行指明 sanctioned 路徑（於非 worker 會話操作或由 owner 執行）」.
+    Expected substrings come from that clause, not from the implementation."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, "1")  # legacy marker: fence every board
+    from hermes_cli import kanban
+
+    import argparse
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd")
+    kanban.build_parser(sub)
+    args = p.parse_args(["kanban", "unblock", "t_any"])
+    rc = kanban.kanban_command(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "cannot mutate Kanban tasks via the CLI" in err
+    assert "kanban_*" in err
+    assert "outside a Kanban worker" in err
