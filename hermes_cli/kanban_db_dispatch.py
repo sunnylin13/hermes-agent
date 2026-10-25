@@ -27,6 +27,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_dispatch_crashlog import (
+    error_fingerprint, exit_summary_marker, log_noise_prefixes)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -928,13 +930,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
-
-
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
@@ -998,17 +993,6 @@ _PROTOCOL_VIOLATION_ERROR = (
 _LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
 
 
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
 def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     """Best-effort read of a dead worker's last printed text, for the board diagnostic.
 
@@ -1031,13 +1015,13 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     if not raw:
         return ""
     raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_exit_summary_marker())
+    cut = raw.rfind(exit_summary_marker())
     if cut != -1:
         raw = raw[:cut]
     lines = []
     for ln in raw.splitlines():
         ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
+        if ln and not ln.startswith(log_noise_prefixes()):
             lines.append(ln)
     return " ".join(lines)[-400:]
 
@@ -1257,7 +1241,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
-        fp = _error_fingerprint(dead.error_text)
+        fp = error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
@@ -1306,7 +1290,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            is_systemic = fp_counts.get(error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
@@ -2055,36 +2039,6 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
-def _declared_card_skills(conn: sqlite3.Connection, task_id: str) -> list[str]:
-    """The card's own ``skills`` list (JSON column), [] when unset/malformed.
-    The review lane's forced ``sdlc-review`` is a dispatcher policy, not a
-    card declaration, and is deliberately out of scope here."""
-    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if row is None or not row["skills"]:
-        return []
-    import json
-    try:
-        raw = json.loads(row["skills"])
-    except Exception:
-        return []
-    return [str(s).strip() for s in raw if str(s or "").strip()] if isinstance(raw, list) else []
-
-
-def _resolve_card_skills(assignee: str, declared: list[str]):
-    """Shared-resolver call for the spawn gate. Unexpected failures fail open
-    (log only): the worker-side load stays the last line of defense — but a
-    genuine missing verdict must never be swallowed into a crash-loop."""
-    try:
-        from hermes_cli.kanban_skill_gate import resolve_profile_skills
-        return resolve_profile_skills(assignee, declared)
-    except Exception:
-        _kb._log.warning(
-            "kanban dispatch: skill-resolution gate skipped for assignee=%r skills=%r",
-            assignee, declared, exc_info=True,
-        )
-        return None
-
-
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2148,30 +2102,13 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
-    # Skill-resolution gate (t_78e230ae, incident t_9691bf56): a card whose
-    # declared skills the assignee profile cannot load used to crash-loop its
-    # worker — eight spawns before anything explained itself. This is the
-    # AUTHORITY gate: create/assign validate optimistically and fail open for
-    # profiles this host cannot see; nothing spawns past here with an
-    # unresolvable name. Refuse WITHOUT claiming (no run, no admission, no
-    # worker) and park the card needs_input naming the missing skill(s).
-    declared = _declared_card_skills(conn, task_id)
-    if declared:
-        resolution = _resolve_card_skills(assignee, declared)
-        if resolution is not None and resolution.missing:
-            missing = list(resolution.missing)
-            result.blocked_missing_skills.append((task_id, missing))
-            if not dry_run:
-                reason = (
-                    f"dispatcher refused the spawn: skill(s) {missing!r} are not "
-                    f"resolvable for assignee profile {assignee!r} (unknown to its "
-                    "skills dirs, or operator-disabled). Fix the card's skills "
-                    "field or install the skill, then unblock."
-                )
-                _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
-                with contextlib.suppress(Exception):
-                    _kb.add_comment(conn, task_id, "dispatcher", reason)
-            return False
+    # Skill-resolution gate (t_78e230ae, incident t_9691bf56): the AUTHORITY
+    # spawn check — nothing spawns past here with a declared skill the assignee
+    # cannot resolve; a refusal claims nothing and parks the card needs_input
+    # naming what is missing (kanban_skill_gate.gate_spawn_skills).
+    from hermes_cli.kanban_skill_gate import gate_spawn_skills
+    if gate_spawn_skills(conn, task_id, assignee, result, dry_run):
+        return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent

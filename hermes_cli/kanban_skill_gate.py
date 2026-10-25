@@ -23,9 +23,11 @@ nonspawnable, and the worker-side raise stays as the last line of defense.
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
+import logging
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ def resolve_profile_skills(
     try:
         from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
         home = resolve_profile_env(normalize_profile_name(profile))
-    except Exception:
+    except Exception:  # health: allow BLE001 -- profile dirs live outside this process's contract; any failure is the documented "not verifiable here" fail-open verdict
         # Unknown/invalid profile or a profile dir this host cannot resolve
         # (cross-host board): fail open, the dispatcher's profile_exists gate
         # and the worker's own load path stay authoritative.
@@ -100,7 +102,7 @@ def _available_skill_names() -> tuple[str, ...]:
         return tuple(
             str(key).lstrip("/") for key in get_skill_commands()
         )
-    except Exception:
+    except Exception:  # health: allow BLE001 -- suggestion scan is best-effort; an empty view only loses the near-miss hint
         return ()
 
 
@@ -125,3 +127,97 @@ def format_unresolvable_error(assignee: str, resolution: SkillResolution) -> str
     else:
         msg += ". Check the profile's skills with `hermes -p " + assignee + " skills list`"
     return msg
+
+
+def check_declared_skills(assignee: Optional[str], skills: Any, log) -> None:
+    """``create_task`` entry check: raise :class:`ValueError` when *assignee*
+    cannot resolve a declared skill; a profile this host cannot verify
+    degrades to a warning and defers to the dispatcher gate (the authority).
+    No-op when either side is unknown (unassigned card / no declared skills).
+    """
+    if not assignee or not skills:
+        return
+    resolution = resolve_profile_skills(assignee, skills)
+    if resolution is None:
+        log.warning(
+            "kanban: could not verify skills %r against assignee %r on this "
+            "host (profile dir unreadable); deferring to the dispatch gate",
+            skills, assignee,
+        )
+    elif resolution.missing:
+        raise ValueError(format_unresolvable_error(assignee, resolution))
+
+
+def check_reassign_skills(conn, task_id: str, profile: Optional[str]) -> None:
+    """``assign_task`` entry check: raise :class:`ValueError` when the NEW
+    assignee cannot resolve the card's declared skills (a handoff to a profile
+    without the skill would crash its worker at startup, so the handoff is
+    refused before anything is written). Unverifiable profiles fail open to
+    the dispatcher gate, matching :func:`check_declared_skills`."""
+    if not profile:
+        return
+    card_skills = declared_card_skills(conn, task_id)
+    if not card_skills:
+        return
+    resolution = resolve_profile_skills(profile, card_skills)
+    if resolution is not None and resolution.missing:
+        raise ValueError(format_unresolvable_error(profile, resolution))
+
+
+def declared_card_skills(conn, task_id: str) -> list[str]:
+    """The card's own ``skills`` list (JSON column), [] when unset/malformed.
+    The review lane's forced ``sdlc-review`` is a dispatcher policy, not a
+    card declaration, and is deliberately out of scope here."""
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not row["skills"]:
+        return []
+    import json
+    try:
+        raw = json.loads(row["skills"])
+    except (ValueError, TypeError):
+        return []
+    return [str(s).strip() for s in raw if str(s or "").strip()] if isinstance(raw, list) else []
+
+
+def format_spawn_refusal(missing: list[str], assignee: str) -> str:
+    """Board-facing refusal text for the authority gate: what is missing, for
+    which profile, and what the operator must do before the next tick."""
+    return (
+        f"dispatcher refused the spawn: skill(s) {missing!r} are not "
+        f"resolvable for assignee profile {assignee!r} (unknown to its "
+        "skills dirs, or operator-disabled). Fix the card's skills "
+        "field or install the skill, then unblock."
+    )
+
+
+def gate_spawn_skills(conn, task_id: str, assignee: str, result: Any, dry_run: bool) -> bool:
+    """AUTHORITY spawn gate for the dispatcher tick: True when the spawn is
+    refused — ``(task_id, missing)`` recorded on ``result.blocked_missing_skills``
+    and (outside dry-run) the card parked ``blocked``/needs_input with the
+    reason as an event and comment, WITHOUT claiming (no run, no admission, no
+    worker). Refuse verdicts come only from a verifiable check: a profile this
+    host cannot see, or an unexpected resolver failure, fails open (log only)
+    and lets the spawn through — the worker-side skill load stays the last
+    line of defense, but a genuine missing verdict never crash-loops again."""
+    declared = declared_card_skills(conn, task_id)
+    if not declared:
+        return False
+    try:
+        resolution = resolve_profile_skills(assignee, declared)
+    except Exception:  # health: allow BLE001 -- the gate itself must never break a dispatch tick; unverifiable fails open by design
+        logging.getLogger("hermes_cli.kanban_db").warning(
+            "kanban dispatch: skill-resolution gate skipped for assignee=%r skills=%r",
+            assignee, declared, exc_info=True,
+        )
+        return False
+    if resolution is None or not resolution.missing:
+        return False
+    missing = list(resolution.missing)
+    result.blocked_missing_skills.append((task_id, missing))
+    if not dry_run:
+        from hermes_cli import kanban_db as _kb
+        reason = format_spawn_refusal(missing, assignee)
+        _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+        with contextlib.suppress(Exception):
+            _kb.add_comment(conn, task_id, "dispatcher", reason)
+    return True
