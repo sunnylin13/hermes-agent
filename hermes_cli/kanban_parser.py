@@ -309,6 +309,12 @@ _SPECS = [
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
+        _arg("--skills", action="extend", nargs="+", metavar="SKILL", default=None,
+             help="Replace the task's force-loaded skills (repeatable or space-"
+                  "separated; one name per token, no comma-joined strings). Same "
+                  "name acceptance as `create --skill`; use --clear-skills to unset."),
+        _arg("--clear-skills", action="store_true",
+             help="Unset the task's skills (stores NULL). Mutually exclusive with --skills."),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
