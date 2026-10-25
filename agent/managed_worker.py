@@ -144,11 +144,22 @@ def bind_worker_policy(frame):
 
 
 class WorkerChannel:
+    # Frames that prove the turn was open: anything past them may have run, and a later death
+    # is a real loss the owner must settle ``unknown``. hello/ready/error are startup/control.
+    _PROGRESS_KINDS = frozenset({'delta', 'result', 'tool.start', 'tool.complete',
+                                 'approval', 'clarify', 'prompt_settled'})
+
     def __init__(self, stream):
         self.stream = stream
         self.lock = threading.Lock()
+        self.ready = False     # execute() reached the turn phase (the agent is constructed)
+        self.progress = False  # any _PROGRESS_KINDS frame left: the turn may have run
 
     def send(self, kind, **payload):
+        if kind == 'ready':
+            self.ready = True
+        elif kind in self._PROGRESS_KINDS:
+            self.progress = True
         data = encode_frame({'type': kind, **payload})
         with self.lock:
             self.stream.write(data)
@@ -467,7 +478,18 @@ def main():
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')
-        channel.send('error', reason='managed_worker_failed')
+        if channel.ready and not channel.progress:
+            # The agent was constructed and the turn phase entered, but no delta/tool/result
+            # frame ever left: the turn never opened and nothing may have run half-way. Name
+            # the exception so the owner settles terminal failed with the real reason instead
+            # of an unknown execution. Earlier deaths (bootstrap read, agent construction —
+            # which books its own credential exit) keep the unknown path: a pre-ready failure
+            # may have left external effects the interpreter's frame cannot disprove. The raw
+            # text rides the private pipe only; the owner force-redacts it before display.
+            channel.send('error', reason='managed_worker_failed',
+                         pre_start_reason=str(sys.exc_info()[1]) or type(sys.exc_info()[1]).__name__)
+        else:
+            channel.send('error', reason='managed_worker_failed')
         return 1
     finally:
         channel.stream.close()
