@@ -430,6 +430,24 @@ def _worker_env(authority):
     return env
 
 
+def _strip_delegated_child_marker(env):
+    """Grant boundary at the managed-spawn point (same rule as the CLI dispatcher, which pops
+    this marker in hermes_cli.kanban_db_dispatch before spawning its worker): a managed worker
+    is a fresh task assignment, never a delegate child, so the descendant fence must not ride
+    into it. Only the marker is popped — the kanban pins (HERMES_KANBAN_DB/WORKSPACES_ROOT/
+    BOARD) pass through untouched, keeping the board-isolation fence. A None env (single-profile
+    byte-for-byte inheritance) stays None when the marker is absent, and becomes an
+    os.environ copy minus the marker only when it is present — one deliberate deviation.
+    """
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    if env is None:
+        if DELEGATED_CHILD_ENV_MARKER not in os.environ:
+            return None
+        env = os.environ.copy()
+    env.pop(DELEGATED_CHILD_ENV_MARKER, None)
+    return env
+
+
 def _launch_env_only_credentials(home, env):
     """Credentials the LAUNCH profile's owner resolves from its frozen launch env
     (``launch_secret_scope``: systemd ``Environment=`` / ``op run`` keys with no ``.env`` line) that
@@ -571,7 +589,7 @@ async def _spawn_registered_worker(authority, ref, row):
     spawning = _mark_spawning(authority, ref, row)
     generation = row.get('generation')
     try:
-        env = await asyncio.to_thread(_worker_env, authority)
+        env = _strip_delegated_child_marker(await asyncio.to_thread(_worker_env, authority))
         cwd = (await asyncio.to_thread(Path(__file__).resolve)).parents[1]
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
