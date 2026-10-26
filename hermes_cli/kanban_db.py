@@ -3049,8 +3049,17 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    skills: Optional[Iterable[str]] = None, clear_skills: bool = False,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    ``skills`` replaces ``tasks.skills`` through the same acceptance as
+    :func:`create_task` (``_normalize_task_skills`` raises on comma-joined
+    strings and toolset names); ``clear_skills=True`` stores NULL. Omit both
+    to leave the column untouched; callers must not pass them together.
+    """
+    # Normalise before the write txn: a refused name must not hold the lock.
+    skills_list = _normalize_task_skills(skills) if skills is not None else None
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3069,6 +3078,14 @@ def edit_task(
             assignments.append("result = ?")
             params.append(result)
             changed_fields.append("result")
+        if clear_skills:
+            assignments.append("skills = ?")
+            params.append(None)
+            changed_fields.append("skills")
+        elif skills is not None:
+            assignments.append("skills = ?")
+            params.append(json.dumps(skills_list))
+            changed_fields.append("skills")
         if not assignments:
             return False
         conn.execute(
@@ -3732,63 +3749,6 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
-def specify_triage_task(
-    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
-    body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
-) -> bool:
-    """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
-    """
-    if title is not None and not title.strip():
-        raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
-        existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
-            (task_id,),
-        ).fetchone()
-        if existing is None:
-            return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
-        changed_fields: list[str] = []
-        if title is not None and title.strip() != (existing["title"] or ""):
-            sets.append("title = ?")
-            params.append(title.strip())
-            changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
-            sets.append("assignee = ?")
-            params.append(assignee)
-            changed_fields.append("assignee")
-        params.append(task_id)
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
-        )
-        if cur.rowcount != 1:
-            return False
-        if changed_fields and author and author.strip():
-            # Not add_comment (own txn + 'commented' event); 'specified' below records it.
-            _insert_comment(
-                conn, task_id, author.strip(),
-                "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
-                int(time.time()),
-            )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
-    # Own IMMEDIATE txn (outside the one above): a parent-free specified task
-    # flips to 'ready' now instead of idling until the next tick.
-    recompute_ready(conn)
-    return True
-
-
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
@@ -4225,6 +4185,9 @@ from hermes_cli.kanban_db_workspace import (
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_db_specify import (
+    specify_triage_task,
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,

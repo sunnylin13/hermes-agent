@@ -951,10 +951,16 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    skills = getattr(args, "skills", None)
+    clear_skills = bool(getattr(args, "clear_skills", False))
+    if skills is not None and clear_skills:
+        return _err("kanban edit: --skills and --clear-skills are mutually exclusive", 2)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if (all(value is None for value in (title, body, priority, result))
+            and skills is None and not clear_skills):
+        return _err("kanban edit: provide --title, --body, --priority, --skills, "
+                    "--clear-skills, or --result", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
@@ -962,6 +968,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
+            skills=skills, clear_skills=clear_skills,
         )
     return _ok_or_err(
         ok,
