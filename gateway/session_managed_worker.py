@@ -454,6 +454,45 @@ def _interrupted_before_bootstrap(authority, row, cause=None):
     return ''
 
 
+def _pre_start_failure_reason(frame) -> str:
+    """The worker's pre-start failure proof: an error frame carrying a
+    non-empty ``pre_start_reason`` — nothing but hello/ready ever left its
+    channel, so the turn never opened. Returns the reason, or '' for every
+    other frame (those keep the unknown branch untouched)."""
+    return frame['pre_start_reason'] if (
+        frame.get('type') == 'error' and set(frame) == {'type', 'reason', 'pre_start_reason'}
+        and frame['reason'] == 'managed_worker_failed'
+        and isinstance(frame['pre_start_reason'], str) and frame['pre_start_reason']
+    ) else ''
+
+
+async def _settle_pre_start_failure(authority, row, scope, reason):
+    """A pre-start error frame is the worker's own proof the turn never opened: no model call,
+    tool or stream frame left the interpreter, so no half-execution can hide behind it. This
+    captures the failed turn and returns — the ``_interrupted_before_bootstrap`` precedent with
+    the failed flag — and lets the drain's ordinary settlement commit terminal ``failed`` with
+    the worker's real reason as the turn's reply. The unknown branch would instead park every
+    accepted follower behind an execution with nothing to lose."""
+    from gateway.session_worker_reservation import retire_prestart_admission_worker
+    from gateway.session_runtime_workers import tracked_write
+    await tracked_write(authority, partial(retire_prestart_admission_worker, authority, row, scope))
+    # The frame rides the private pipe, but its text reaches the transcript and the card reply:
+    # the same force-redaction the stderr log applies before anything lands on disk.
+    from agent.redact import redact_sensitive_text
+    detail = redact_sensitive_text(reason[:400], force=True).strip() or 'managed_worker_failed'
+    notice = f'Managed worker failed before the turn started: {detail}'
+    authority.pending_results[row['admission_id']] = {
+        'result': {'final_response': notice, 'failed': True}, 'usage': {}}
+    return notice
+
+
+def _resolve_unknown_waiter(waiter) -> None:
+    """Wake the admission's own waiter with the unknown notice; a waiter that
+    already resolved (or never registered) is nobody's business."""
+    if waiter is not None and not waiter.done():
+        waiter.set_result('Worker execution is unknown.')
+
+
 def _latched_stop_cause(authority, session_id, generation):
     """The gateway restart/shutdown cause latched for this generation before its worker existed
     (``run_runtime._stop_spawning_managed``), consumed once; None for a user's Stop."""
@@ -644,6 +683,13 @@ async def execute_managed(authority, ref, row, policy):
                     continue
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise RuntimeStoreError('managed_worker_failed')
+            _prestart = _pre_start_failure_reason(frame)
+            if _prestart:
+                # The worker's own proof that the turn never opened (nothing was ever sent on
+                # its channel but hello/ready): settle failed now, never through the unknown
+                # branch below, which would park every accepted follower over a zero-side-
+                # effect failure. Every other error frame keeps the unknown path untouched.
+                return await _settle_pre_start_failure(authority, row, scope, _prestart)
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
                 continue
@@ -694,8 +740,7 @@ async def execute_managed(authority, ref, row, policy):
                 'content': 'Worker execution is unknown.', 'admission_id': row['admission_id'], 'outcome': 'unknown',
                 'status': 'error'})  # the message.complete TurnStatus: never painted as a normal finish
         waiter = authority.waiters.pop(row['admission_id'], None)
-        if waiter is not None and not waiter.done():
-            waiter.set_result('Worker execution is unknown.')
+        _resolve_unknown_waiter(waiter)
         # Stop this drain without its ordinary Exception→failed settlement. The
         # committed unknown row deliberately pauses every accepted follower.
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
